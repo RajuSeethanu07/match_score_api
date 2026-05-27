@@ -51,11 +51,11 @@ class ScoringDataContainer(BaseModel):
     finalScores: FinalScoresEnvelope
     jdMetadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="Audit tracking metadata dictionary retrieved from the InhouseJdParser database collection"
+        description="Audit tracking metadata dictionary retrieved from the InhouseJdParser db in the records collection"
     )
     resumeMetadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="Audit tracking metadata dictionary retrieved from the InhouseResumeParser database collection"
+        description="Audit tracking metadata dictionary retrieved from the InhouseResumeParser db in the records collection"
     )
 
 class MatchScoreResponse(BaseModel):

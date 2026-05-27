@@ -38,21 +38,26 @@ class DBMapper:
         return re.sub(r"\s+", " ", str(text)).strip()
 
     # ==========================================================
-    # SAFE RESUME ROOT HANDLING (FIXED + HARDENED)
+    # SAFE RESUME ROOT HANDLING (UPDATED FOR DEEP NESTING)
     # ==========================================================
     @staticmethod
     def _get_resume_root(doc: dict) -> dict:
         if not isinstance(doc, dict):
             return {}
 
-        parsed = doc.get("parsed_resume")
+        # Step 1: Handle completeResumeDetails encapsulation wrapper
+        complete_details = doc.get("completeResumeDetails")
+        if isinstance(complete_details, dict):
+            parsed = complete_details.get("parsed_resume")
+        else:
+            parsed = doc.get("parsed_resume")
 
         if isinstance(parsed, dict):
-            # Case 1: wrapped format
+            # Case 1: deeply wrapped parser payload structure
             if isinstance(parsed.get("ResumeParserData"), dict):
                 return parsed["ResumeParserData"]
 
-            # Case 2: already flat
+            # Case 2: flattened dictionary schema
             return parsed
 
         return {}
@@ -247,9 +252,11 @@ class DBMapper:
             raw_text
             or doc.get("jd_raw_text")
             or doc.get("Jd_Embeddings", {}).get("jd_raw_text")
-            or parsed.get("jobOverview")
             or ""
         ).strip()
+
+        if not final_raw_text:
+            final_raw_text = cls._normalize_text(parsed.get("jobOverview"))
 
         semantic_contexts = cls._extract_jd_contexts(parsed)
 
@@ -273,13 +280,17 @@ class DBMapper:
         )
 
     # ==========================================================
-    # RESUME MAPPING (FINAL SAFE VERSION)
+    # RESUME MAPPING
     # ==========================================================
     @classmethod
     def map_parsed_resume(cls, doc: dict, raw_text: str = "") -> ParsedResume:
 
         parsed = cls._get_resume_root(doc)
         personal = doc.get("personal_info") or {}
+
+        # Handle potential nesting for cases where personal_info lives inside completeResumeDetails
+        if not personal and isinstance(doc.get("completeResumeDetails"), dict):
+            personal = doc["completeResumeDetails"].get("personal_info") or {}
 
         first = cls._normalize_text(personal.get("firstName"))
         last = cls._normalize_text(personal.get("lastName"))
@@ -290,9 +301,11 @@ class DBMapper:
             raw_text
             or doc.get("cv_raw_text")
             or doc.get("Cv_embeddings", {}).get("cv_raw_text")
-            or parsed.get("RawText")
             or ""
         ).strip()
+
+        if not final_raw_text:
+            final_raw_text = cls._normalize_text(parsed.get("RawText"))
 
         skills = cls._extract_resume_skills(parsed)
         semantic_contexts = cls._extract_resume_experience_contexts(parsed)

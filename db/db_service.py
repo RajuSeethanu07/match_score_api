@@ -13,7 +13,6 @@ from bson.errors import InvalidId
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from config import settings
-from db.db_mapper import DBMapper   # 🔥 REQUIRED FIX
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +48,10 @@ class DatabaseService:
     def inhouse_jd_parser_db(self):
         return self.client[settings.mongodb_db_jd_parser]
 
+    @property
+    def inhouse_resume_parser_db(self):
+        return self.client[getattr(settings, "mongodb_db_resume_parser", "InhouseResumeParser")]
+
     # ==========================================================
     # ID NORMALIZER
     # ==========================================================
@@ -68,9 +71,9 @@ class DatabaseService:
             return clean_str
 
     # ==========================================================
-    # JD FETCH (NOW MAPPED)
+    # JD FETCH (CLEAN DATA OVER WIRE)
     # ==========================================================
-    async def get_parsed_jd(self, contest_id: str):
+    async def get_parsed_jd(self, contest_id: str) -> dict:
         target_contest_id = self._normalize_and_convert_id(contest_id)
 
         if not isinstance(target_contest_id, ObjectId):
@@ -94,49 +97,46 @@ class DatabaseService:
         if not parsed_jd_doc:
             raise self.DocumentNotFoundError("Parsed JD not found")
 
-        # inject metadata
-        parsed_jd_doc["details"] = contest_doc.get("details", {})
+        parsed_jd_doc["details"] = contest_doc.get("details", {}) or {}
         parsed_jd_doc["jdKey"] = (
             contest_doc.get("jdKey")
             or contest_doc.get("jdkey")
             or contest_doc.get("jdUrl")
+            or ""
         )
-        parsed_jd_doc["jdUrl"] = contest_doc.get("jdUrl")
+        parsed_jd_doc["jdUrl"] = contest_doc.get("jdUrl") or ""
 
-        # 🔥 IMPORTANT FIX: ALWAYS RETURN MAPPED OBJECT
-        return DBMapper.map_parsed_jd(parsed_jd_doc)
+        return parsed_jd_doc
 
     # ==========================================================
-    # RESUME FETCH (CRITICAL FIX HERE)
+    # RESUME FETCH (CLEAN RAW DATA OVER WIRE)
     # ==========================================================
-    async def get_parsed_resume(self, js_id: str):
+    async def get_parsed_resume(self, js_id: str) -> dict:
         target_js_id = self._normalize_and_convert_id(js_id)
 
         if not isinstance(target_js_id, ObjectId):
             raise self.InvalidIdError(f"Invalid jsId format: {js_id}")
 
-        resume_doc = await self.marketplace_db.jobSeekerProfile.find_one(
-            {"_id": target_js_id},
-            {"_id": 0}
+        resume_doc = await self.inhouse_resume_parser_db.records.find_one(
+            {"_id": target_js_id}
         )
 
         if not resume_doc:
-            raise self.DocumentNotFoundError("Profile not found")
+            logger.warning("Resume parser record not found for jsId=%s, trying marketplace fallback profile", js_id)
+            resume_doc = await self.marketplace_db.jobSeekerProfile.find_one(
+                {"_id": target_js_id}
+            )
 
-        logger.info("JOB SEEKER PROFILE FETCHED SUCCESSFULLY")
+        if not resume_doc:
+            raise self.DocumentNotFoundError(f"Profile data completely missing for candidate id: {js_id}")
 
-        # 🔥 CRITICAL FIX: ALWAYS MAP BEFORE RETURNING
-        mapped_resume = DBMapper.map_parsed_resume(resume_doc)
-
-        return {
-            "raw_doc": resume_doc,
-            "parsed_resume": mapped_resume
-        }
+        logger.info("JOB SEEKER PROFILE FETCHED SUCCESSFULLY | jsId=%s", js_id)
+        return resume_doc
 
     # ==========================================================
-    # CV METADATA (UNCHANGED)
+    # CV METADATA
     # ==========================================================
-    async def get_cv_meta_metadata(self, contest_id: str, recruiter_id: str, js_id: str):
+    async def get_cv_meta_metadata(self, contest_id: str, recruiter_id: str, js_id: str) -> str:
         target_contest_id = self._normalize_and_convert_id(contest_id)
         target_recruiter_id = self._normalize_and_convert_id(recruiter_id)
         target_js_id = self._normalize_and_convert_id(js_id)
@@ -153,33 +153,32 @@ class DatabaseService:
         root_cv = profile_doc.get("cv")
 
         if root_cv:
-            return (
-                root_cv.get("url")
-                or root_cv.get("secureUrl")
-                or root_cv.get("s3Url")
-                if isinstance(root_cv, dict)
-                else root_cv
-            )
+            if isinstance(root_cv, dict):
+                return root_cv.get("url") or root_cv.get("secureUrl") or root_cv.get("s3Url") or ""
+            return str(root_cv)
 
-        for item in profile_doc.get("jobseekerDetails", []):
-            item_js_id = self._normalize_and_convert_id(item.get("jsId"))
+        jobseeker_details = profile_doc.get("jobseekerDetails", [])
+        if isinstance(jobseeker_details, list):
+            for item in jobseeker_details:
+                if not isinstance(item, dict):
+                    continue
+                    
+                item_js_id = self._normalize_and_convert_id(item.get("jsId"))
+                if item_js_id != target_js_id:
+                    continue
 
-            if item_js_id != target_js_id:
-                continue
+                cv_data = item.get("cv") or item.get("resume") or item.get("cvUrl")
 
-            cv_data = item.get("cv") or item.get("resume") or item.get("cvUrl")
+                if isinstance(cv_data, dict):
+                    return cv_data.get("url") or cv_data.get("secureUrl") or cv_data.get("s3Url") or ""
+                return str(cv_data or "")
 
-            if isinstance(cv_data, dict):
-                return cv_data.get("url") or cv_data.get("secureUrl") or cv_data.get("s3Url")
-
-            return cv_data
-
-        raise self.DocumentNotFoundError("CV metadata missing")
+        raise self.DocumentNotFoundError("CV metadata missing inside profile map")
 
     # ==========================================================
-    # CACHE FUNCTIONS (UNCHANGED)
+    # CACHE FUNCTIONS
     # ==========================================================
-    async def get_jd_cache(self, contest_id: str):
+    async def get_jd_cache(self, contest_id: str) -> dict:
         target_contest_id = self._normalize_and_convert_id(contest_id)
 
         cache_doc = await self.marketplace_db.Jd_Embeddings.find_one(
@@ -192,7 +191,7 @@ class DatabaseService:
             "raw_text": cache_doc.get("jd_raw_text", "") if cache_doc else ""
         }
 
-    async def cache_jd_data(self, contest_id: str, embeddings: List[float], raw_text: str):
+    async def cache_jd_data(self, contest_id: str, embeddings: List[float], raw_text: str) -> None:
         target_contest_id = self._normalize_and_convert_id(contest_id)
 
         await self.marketplace_db.Jd_Embeddings.update_one(
@@ -208,7 +207,7 @@ class DatabaseService:
             upsert=True
         )
 
-    async def get_cv_cache(self, contest_id: str, js_id: str):
+    async def get_cv_cache(self, contest_id: str, js_id: str) -> dict:
         target_contest_id = self._normalize_and_convert_id(contest_id)
         target_js_id = self._normalize_and_convert_id(js_id)
 
@@ -225,7 +224,7 @@ class DatabaseService:
             "raw_text": cache_doc.get("cv_raw_text", "") if cache_doc else ""
         }
 
-    async def cache_cv_data(self, contest_id: str, js_id: str, embeddings: List[float], raw_text: str):
+    async def cache_cv_data(self, contest_id: str, js_id: str, embeddings: List[float], raw_text: str) -> None:
         target_contest_id = self._normalize_and_convert_id(contest_id)
         target_js_id = self._normalize_and_convert_id(js_id)
 
@@ -242,7 +241,99 @@ class DatabaseService:
             upsert=True
         )
 
-    async def close(self):
+    # ==========================================================
+    # NEW MICRO-SKILL OBJECT EMBEDDING COMPONENT INTEGRATIONS
+    # ==========================================================
+    async def get_or_create_jd_skills_meta(
+        self, semantic_engine: Any, contest_id: str, raw_jd_skills: List[str]
+    ) -> Dict[str, List[float]]:
+        """
+        Ensures JD requirements are batch embedded and cached inside Jd_Embeddings record.
+        Uses upsert mechanics to handle edge race condition states smoothly.
+        """
+        try:
+            query_id = self._normalize_and_convert_id(contest_id)
+
+            doc = await self.marketplace_db.Jd_Embeddings.find_one({"contestId": query_id})
+            
+            # ⚡ MONGO CACHE HIT
+            if doc and "jd_skills_embeddings" in doc and doc["jd_skills_embeddings"]:
+                logger.info("✨ [MONGO JD SKILLS HIT] | Loaded vectors directly from Jd_Embeddings.")
+                return doc["jd_skills_embeddings"]
+
+            # 🔍 MONGO CACHE MISS
+            logger.info("🔍 [MONGO JD SKILLS MISS] | Generating bulk OpenAI vectors for JD skills")
+            fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_jd_skills)
+
+            if fresh_vectors:
+                # 🚀 FIX: Convert to atomic upsert operation so it doesn't fail on a cold first-time run
+                await self.marketplace_db.Jd_Embeddings.update_one(
+                    {"contestId": query_id},
+                    {
+                        "$set": {
+                            "jd_skills_embeddings": fresh_vectors,
+                            "updatedAt": datetime.now(timezone.utc)
+                        },
+                        "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+                    },
+                    upsert=True
+                )
+                logger.info("💾 [MONGO JD SKILLS SAVE] | Injected embedded map into Jd_Embeddings.")
+
+            return fresh_vectors
+
+        except Exception as e:
+            logger.error("❌ Database tracking failed inside get_or_create_jd_skills_meta: %s", e)
+            return {}
+
+    async def get_or_create_cv_skills_meta(
+        self, semantic_engine: Any, contest_id: str, js_id: str, raw_cv_skills: List[str]
+    ) -> Dict[str, List[float]]:
+        """
+        Ensures Candidate profile components are batch embedded and cached inside Cv_Embeddings record.
+        Uses explicit compound targeting fields to align with baseline structural tracking layouts.
+        """
+        try:
+            query_contest_id = self._normalize_and_convert_id(contest_id)
+            query_js_id = self._normalize_and_convert_id(js_id)
+
+            # 🚀 FIX: Use compound indexing matching exactly how main.py queries data structures
+            doc = await self.marketplace_db.Cv_Embeddings.find_one({
+                "contestId": query_contest_id, 
+                "jsId": query_js_id
+            })
+            
+            # ⚡ MONGO CACHE HIT
+            if doc and "cv_skills_embeddings" in doc and doc["cv_skills_embeddings"]:
+                logger.info("✨ [MONGO CV SKILLS HIT] | Loaded vectors directly from Cv_Embeddings.")
+                return doc["cv_skills_embeddings"]
+
+            # 🔍 MONGO CACHE MISS
+            logger.info("🔍 [MONGO CV SKILLS MISS] | Generating bulk OpenAI vectors for CV skills")
+            fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_cv_skills)
+
+            if fresh_vectors:
+                # 🚀 FIX: Convert to atomic upsert operation matching production constraints
+                await self.marketplace_db.Cv_Embeddings.update_one(
+                    {"contestId": query_contest_id, "jsId": query_js_id},
+                    {
+                        "$set": {
+                            "cv_skills_embeddings": fresh_vectors,
+                            "updatedAt": datetime.now(timezone.utc)
+                        },
+                        "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+                    },
+                    upsert=True
+                )
+                logger.info("💾 [MONGO CV SKILLS SAVE] | Injected embedded map into Cv_Embeddings.")
+
+            return fresh_vectors
+
+        except Exception as e:
+            logger.error("❌ Database tracking failed inside get_or_create_cv_skills_meta: %s", e)
+            return {}
+
+    async def close(self) -> None:
         if self.client:
             self.client.close()
 
