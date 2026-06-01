@@ -51,7 +51,8 @@ class SemanticEngine:
         if len(text) < 2 and text not in ["c", "r"]:
             return False
             
-        if len(text) > 50:
+        # ⚡ FIX: Increased from 50 to 100 to support multi-skill lines containing commas
+        if len(text) > 100:
             return False
             
         if text.isdigit() or not re.search(r'[a-zA-Z]', text):
@@ -60,13 +61,13 @@ class SemanticEngine:
         return True
 
     # ======================================================================
-    # MICRO LAYER: BULK SKILLS BATCH EMBEDDING
+    # MICRO LAYER: BULK SKILLS BATCH EMBEDDING WITH SAFETY CHUNKING
     # ======================================================================
 
     async def generate_bulk_skills_embeddings(self, skills: List[str]) -> Dict[str, List[float]]:
         """
         Takes a raw list of parsed skills from a profile document, sanitizes them, 
-        and requests vectors from OpenAI in a single efficient batch network call.
+        and requests vectors from OpenAI in efficient batch network calls.
         """
         embedded_skills_dict: Dict[str, List[float]] = {}
         skills_to_fetch: List[str] = []
@@ -89,24 +90,29 @@ class SemanticEngine:
             return embedded_skills_dict
 
         try:
-            logger.info("🌐 [OPENAI BATCH CALL] | Dispatching concurrent requests for %d skills", len(skills_to_fetch))
+            logger.info("🌐 [OPENAI BATCH LAYER] | Preparing batch requests for %d unique missing skills", len(skills_to_fetch))
             
-            # OpenAI natively accepts an array of clean strings for batch processing
-            response = await self.client.embeddings.create(
-                model=self.embedding_model,
-                input=skills_to_fetch,
-                encoding_format="float",
-            )
-
-            for idx, item in enumerate(response.data):
-                vector = item.embedding
-                skill_key = skills_to_fetch[idx]
+            # CHUNKING CONFIGURATION: OpenAI handles up to 2048 inputs per request cleanly
+            CHUNK_SIZE = 2048
+            for i in range(0, len(skills_to_fetch), CHUNK_SIZE):
+                chunk = skills_to_fetch[i : i + CHUNK_SIZE]
                 
-                # Update runtime state and result dictionary simultaneously
-                _GLOBAL_SKILL_CACHE[skill_key] = vector
-                embedded_skills_dict[skill_key] = vector
+                logger.info("📡 Dispatching OpenAI chunk payload: items %d to %d", i, i + len(chunk))
+                response = await self.client.embeddings.create(
+                    model=self.embedding_model,
+                    input=chunk,
+                    encoding_format="float",
+                )
 
-            logger.info("✨ Successfully processed batch embeddings for unique skills.")
+                for idx, item in enumerate(response.data):
+                    vector = item.embedding
+                    skill_key = chunk[idx]
+                    
+                    # Update runtime state and result dictionary simultaneously
+                    _GLOBAL_SKILL_CACHE[skill_key] = vector
+                    embedded_skills_dict[skill_key] = vector
+
+            logger.info("✨ Successfully processed bulk batch embeddings for unique skills.")
 
         except Exception as exc:
             logger.error("❌ Failed batch skill embedding generation via OpenAI: %s", exc)
@@ -137,7 +143,7 @@ class SemanticEngine:
             logger.info("✨ [RAM CACHE HIT] | Found memory vector for: '%s'", cleaned_text[:50])
             return _GLOBAL_SKILL_CACHE[cleaned_text]
 
-        # STEP 2: PERSISTENT MONGODB LAYER LOOKUP (Aligned with actual structures)
+        # STEP 2: PERSISTENT MONGODB LAYER LOOKUP
         if self.db is not None:
             try:
                 if is_skill:

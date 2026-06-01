@@ -74,7 +74,8 @@ class DBMapper:
 
         skill_block = parsed_resume_data.get("SkillBlock")
         if isinstance(skill_block, str):
-            extracted.update(s.strip() for s in skill_block.split(",") if s.strip())
+            # Clean trailing periods and split by comma
+            extracted.update(s.strip().rstrip(".") for s in skill_block.split(",") if s.strip())
 
         legacy = parsed_resume_data.get("SegregatedSkill", [])
         if isinstance(legacy, list):
@@ -173,11 +174,19 @@ class DBMapper:
             if not isinstance(exp, dict):
                 continue
 
+            # Safe extraction out of inner dict structures like Employer and JobProfile
+            employer_data = exp.get("Employer")
+            employer = employer_data.get("EmployerName") if isinstance(employer_data, dict) else ""
+            
+            profile_data = exp.get("JobProfile")
+            designation = profile_data.get("Title") if isinstance(profile_data, dict) else ""
+            related_skills = profile_data.get("RelatedSkills") if isinstance(profile_data, dict) else ""
+
             parts = [
-                cls._normalize_text(exp.get("Designation")),
-                cls._normalize_text(exp.get("Employer")),
-                cls._normalize_text(exp.get("JobProfile") or exp.get("Summary")),
-                cls._normalize_text(exp.get("RelatedSkills")),
+                cls._normalize_text(designation or exp.get("Designation")),
+                cls._normalize_text(employer or exp.get("Employer")),
+                cls._normalize_text(exp.get("JobDescription") or exp.get("JobProfile") or exp.get("Summary")),
+                cls._normalize_text(related_skills or exp.get("RelatedSkills")),
             ]
 
             text = cls._clean_text(" | ".join([p for p in parts if p]))
@@ -292,8 +301,13 @@ class DBMapper:
         if not personal and isinstance(doc.get("completeResumeDetails"), dict):
             personal = doc["completeResumeDetails"].get("personal_info") or {}
 
-        first = cls._normalize_text(personal.get("firstName"))
-        last = cls._normalize_text(personal.get("lastName"))
+        # Fallback to structural parsed values if personal_info overrides are completely absent
+        first = cls._normalize_text(personal.get("firstName") or parsed.get("Name", {}).get("FirstName", ""))
+        last = cls._normalize_text(personal.get("lastName") or parsed.get("Name", {}).get("LastName", ""))
+        
+        candidate_name = f"{first} {last}".strip()
+        if not candidate_name or candidate_name == "Unknown":
+            candidate_name = cls._normalize_text(parsed.get("Name", {}).get("FullName", "Unknown"))
 
         experience = cls._safe_float(personal.get("totalExperience"))
 
@@ -304,22 +318,26 @@ class DBMapper:
             or ""
         ).strip()
 
-        if not final_raw_text:
-            final_raw_text = cls._normalize_text(parsed.get("RawText"))
-
         skills = cls._extract_resume_skills(parsed)
         semantic_contexts = cls._extract_resume_experience_contexts(parsed)
         locations = cls._extract_resume_locations(parsed, doc)
 
-        email = ""
+        if not final_raw_text:
+            # Fallback to joining all parsed job profile/descriptions contexts into structural text block
+            final_raw_text = " ".join(semantic_contexts) if semantic_contexts else cls._normalize_text(parsed.get("RawText"))
+
+        email = cls._normalize_text(personal.get("email"))
         emails = parsed.get("Email", [])
-        if isinstance(emails, list) and emails:
+        if not email and isinstance(emails, list) and emails:
             email = emails[0].get("EmailAddress", "")
 
-        phone = ""
+        phone = cls._normalize_text(personal.get("phoneNumber"))
         phones = parsed.get("PhoneNumber", [])
-        if isinstance(phones, list) and phones:
+        if not phone and isinstance(phones, list) and phones:
             phone = phones[0].get("FormattedNumber") or phones[0].get("Number") or ""
+
+        # Safe evaluation checking against both structural and misspelled variations
+        education = cls._normalize_text(personal.get("educationalQualifucation") or personal.get("educationalQualification"))
 
         return ParsedResume(
             raw_text=final_raw_text,
@@ -328,10 +346,10 @@ class DBMapper:
             total_experience_years=experience,
             experience_string_display=f"{experience} years" if experience else "Not specified",
             locations=locations,
-            candidate_name=f"{first} {last}".strip() or "Unknown",
+            candidate_name=candidate_name,
             email=email,
             phone=phone,
-            education=cls._normalize_text(personal.get("educationalQualification")),
+            education=education,
             metadata={
                 "mongo_id": str(doc.get("_id") or ""),
                 "first_name": first,

@@ -50,7 +50,8 @@ class DatabaseService:
 
     @property
     def inhouse_resume_parser_db(self):
-        return self.client[getattr(settings, "mongodb_db_resume_parser", "InhouseResumeParser")]
+        # ⚡ FIXED: Pointing directly to the Marketplace DB since separate DB doesn't exist
+        return self.client[settings.mongodb_db_marketplace]
 
     # ==========================================================
     # ID NORMALIZER
@@ -117,15 +118,10 @@ class DatabaseService:
         if not isinstance(target_js_id, ObjectId):
             raise self.InvalidIdError(f"Invalid jsId format: {js_id}")
 
-        resume_doc = await self.inhouse_resume_parser_db.records.find_one(
+        # ⚡ FIXED: Pointing primary target directly to Marketplace.jobSeekerProfile
+        resume_doc = await self.marketplace_db.jobSeekerProfile.find_one(
             {"_id": target_js_id}
         )
-
-        if not resume_doc:
-            logger.warning("Resume parser record not found for jsId=%s, trying marketplace fallback profile", js_id)
-            resume_doc = await self.marketplace_db.jobSeekerProfile.find_one(
-                {"_id": target_js_id}
-            )
 
         if not resume_doc:
             raise self.DocumentNotFoundError(f"Profile data completely missing for candidate id: {js_id}")
@@ -256,17 +252,14 @@ class DatabaseService:
 
             doc = await self.marketplace_db.Jd_Embeddings.find_one({"contestId": query_id})
             
-            # ⚡ MONGO CACHE HIT
             if doc and "jd_skills_embeddings" in doc and doc["jd_skills_embeddings"]:
                 logger.info("✨ [MONGO JD SKILLS HIT] | Loaded vectors directly from Jd_Embeddings.")
                 return doc["jd_skills_embeddings"]
 
-            # 🔍 MONGO CACHE MISS
             logger.info("🔍 [MONGO JD SKILLS MISS] | Generating bulk OpenAI vectors for JD skills")
             fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_jd_skills)
 
             if fresh_vectors:
-                # 🚀 FIX: Convert to atomic upsert operation so it doesn't fail on a cold first-time run
                 await self.marketplace_db.Jd_Embeddings.update_one(
                     {"contestId": query_id},
                     {
@@ -297,23 +290,19 @@ class DatabaseService:
             query_contest_id = self._normalize_and_convert_id(contest_id)
             query_js_id = self._normalize_and_convert_id(js_id)
 
-            # 🚀 FIX: Use compound indexing matching exactly how main.py queries data structures
             doc = await self.marketplace_db.Cv_Embeddings.find_one({
                 "contestId": query_contest_id, 
                 "jsId": query_js_id
             })
             
-            # ⚡ MONGO CACHE HIT
             if doc and "cv_skills_embeddings" in doc and doc["cv_skills_embeddings"]:
                 logger.info("✨ [MONGO CV SKILLS HIT] | Loaded vectors directly from Cv_Embeddings.")
                 return doc["cv_skills_embeddings"]
 
-            # 🔍 MONGO CACHE MISS
             logger.info("🔍 [MONGO CV SKILLS MISS] | Generating bulk OpenAI vectors for CV skills")
             fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_cv_skills)
 
             if fresh_vectors:
-                # 🚀 FIX: Convert to atomic upsert operation matching production constraints
                 await self.marketplace_db.Cv_Embeddings.update_one(
                     {"contestId": query_contest_id, "jsId": query_js_id},
                     {
