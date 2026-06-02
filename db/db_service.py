@@ -238,89 +238,90 @@ class DatabaseService:
         )
 
     # ==========================================================
-    # NEW MICRO-SKILL OBJECT EMBEDDING COMPONENT INTEGRATIONS
+    # MICRO-SKILL OBJECT EMBEDDING COMPONENT INTEGRATIONS
     # ==========================================================
     async def get_or_create_jd_skills_meta(
         self, semantic_engine: Any, contest_id: str, raw_jd_skills: List[str]
-    ) -> Dict[str, List[float]]:
+    ) -> Dict[str, List[float]] | None:
         """
-        Ensures JD requirements are batch embedded and cached inside Jd_Embeddings record.
-        Uses upsert mechanics to handle edge race condition states smoothly.
+        Ensures JD requirements are batch embedded and cached.
+        Explicitly saves and returns None (null) if the skills list is empty.
         """
         try:
             query_id = self._normalize_and_convert_id(contest_id)
-
             doc = await self.marketplace_db.Jd_Embeddings.find_one({"contestId": query_id})
             
-            if doc and "jd_skills_embeddings" in doc and doc["jd_skills_embeddings"]:
-                logger.info("✨ [MONGO JD SKILLS HIT] | Loaded vectors directly from Jd_Embeddings.")
+            # Check if key exists in document. If it is None, return None.
+            if doc and "jd_skills_embeddings" in doc:
+                logger.info("✨ [MONGO JD SKILLS HIT] | Loaded field entry from Jd_Embeddings.")
                 return doc["jd_skills_embeddings"]
 
-            logger.info("🔍 [MONGO JD SKILLS MISS] | Generating bulk OpenAI vectors for JD skills")
-            fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_jd_skills)
+            fresh_vectors = None
+            if raw_jd_skills:
+                logger.info("🔍 [MONGO JD SKILLS MISS] | Generating bulk OpenAI vectors")
+                fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_jd_skills)
+            else:
+                logger.warning("⚠️ No JD skills available. Saving null mapping to DB.")
 
-            if fresh_vectors:
-                await self.marketplace_db.Jd_Embeddings.update_one(
-                    {"contestId": query_id},
-                    {
-                        "$set": {
-                            "jd_skills_embeddings": fresh_vectors,
-                            "updatedAt": datetime.now(timezone.utc)
-                        },
-                        "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+            await self.marketplace_db.Jd_Embeddings.update_one(
+                {"contestId": query_id},
+                {
+                    "$set": {
+                        "jd_skills_embeddings": fresh_vectors, # Storing None as null
+                        "updatedAt": datetime.now(timezone.utc)
                     },
-                    upsert=True
-                )
-                logger.info("💾 [MONGO JD SKILLS SAVE] | Injected embedded map into Jd_Embeddings.")
-
+                    "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+                },
+                upsert=True
+            )
             return fresh_vectors
 
         except Exception as e:
-            logger.error("❌ Database tracking failed inside get_or_create_jd_skills_meta: %s", e)
-            return {}
+            logger.error("❌ Database tracking failed in get_or_create_jd_skills_meta: %s", e)
+            return None
 
     async def get_or_create_cv_skills_meta(
         self, semantic_engine: Any, contest_id: str, js_id: str, raw_cv_skills: List[str]
-    ) -> Dict[str, List[float]]:
+    ) -> Dict[str, List[float]] | None:
         """
-        Ensures Candidate profile components are batch embedded and cached inside Cv_Embeddings record.
-        Uses explicit compound targeting fields to align with baseline structural tracking layouts.
+        Ensures Candidate profile components are batch embedded and cached.
+        Explicitly saves and returns None (null) if the skills list is empty.
         """
         try:
             query_contest_id = self._normalize_and_convert_id(contest_id)
             query_js_id = self._normalize_and_convert_id(js_id)
 
             doc = await self.marketplace_db.Cv_Embeddings.find_one({
-                "contestId": query_contest_id, 
-                "jsId": query_js_id
+                "contestId": query_contest_id, "jsId": query_js_id
             })
             
-            if doc and "cv_skills_embeddings" in doc and doc["cv_skills_embeddings"]:
-                logger.info("✨ [MONGO CV SKILLS HIT] | Loaded vectors directly from Cv_Embeddings.")
+            if doc and "cv_skills_embeddings" in doc:
+                logger.info("✨ [MONGO CV SKILLS HIT] | Loaded field entry from Cv_Embeddings.")
                 return doc["cv_skills_embeddings"]
 
-            logger.info("🔍 [MONGO CV SKILLS MISS] | Generating bulk OpenAI vectors for CV skills")
-            fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_cv_skills)
+            fresh_vectors = None
+            if raw_cv_skills:
+                logger.info("🔍 [MONGO CV SKILLS MISS] | Generating bulk OpenAI vectors")
+                fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_cv_skills)
+            else:
+                logger.warning("⚠️ No CV skills for jsId: %s. Saving null mapping.", js_id)
 
-            if fresh_vectors:
-                await self.marketplace_db.Cv_Embeddings.update_one(
-                    {"contestId": query_contest_id, "jsId": query_js_id},
-                    {
-                        "$set": {
-                            "cv_skills_embeddings": fresh_vectors,
-                            "updatedAt": datetime.now(timezone.utc)
-                        },
-                        "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+            await self.marketplace_db.Cv_Embeddings.update_one(
+                {"contestId": query_contest_id, "jsId": query_js_id},
+                {
+                    "$set": {
+                        "cv_skills_embeddings": fresh_vectors, # Storing None as null
+                        "updatedAt": datetime.now(timezone.utc)
                     },
-                    upsert=True
-                )
-                logger.info("💾 [MONGO CV SKILLS SAVE] | Injected embedded map into Cv_Embeddings.")
-
+                    "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+                },
+                upsert=True
+            )
             return fresh_vectors
 
         except Exception as e:
-            logger.error("❌ Database tracking failed inside get_or_create_cv_skills_meta: %s", e)
-            return {}
+            logger.error("❌ Database tracking failed in get_or_create_cv_skills_meta: %s", e)
+            return None
 
     async def close(self) -> None:
         if self.client:

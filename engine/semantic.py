@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time  # ⏱️ High-resolution timing tracking
 from typing import Dict, List
 
 import numpy as np
@@ -64,11 +65,13 @@ class SemanticEngine:
     # MICRO LAYER: BULK SKILLS BATCH EMBEDDING WITH SAFETY CHUNKING
     # ======================================================================
 
-    async def generate_bulk_skills_embeddings(self, skills: List[str]) -> Dict[str, List[float]]:
+    async def generate_bulk_skills_embeddings(self, skills: List[str], context: str = "UNKNOWN") -> Dict[str, List[float]]:
         """
         Takes a raw list of parsed skills from a profile document, sanitizes them, 
         and requests vectors from OpenAI in efficient batch network calls.
+        Tracks execution metrics for internal auditing logs and SAVES to MongoDB.
         """
+        start_time = time.perf_counter()  # ⏱️ Start micro skills timer
         embedded_skills_dict: Dict[str, List[float]] = {}
         skills_to_fetch: List[str] = []
 
@@ -87,35 +90,61 @@ class SemanticEngine:
                     skills_to_fetch.append(cleaned)
 
         if not skills_to_fetch:
+            elapsed_time = time.perf_counter() - start_time
+            logger.info("✨ [SKILLS EMBEDDING TIMING] [%s] All skills found in cache. Processing completed in %.4f seconds.", context, elapsed_time)
             return embedded_skills_dict
 
         try:
-            logger.info("🌐 [OPENAI BATCH LAYER] | Preparing batch requests for %d unique missing skills", len(skills_to_fetch))
+            logger.info("🌐 [OPENAI BATCH LAYER] [%s] | Preparing batch requests for %d unique missing skills", context, len(skills_to_fetch))
             
             # CHUNKING CONFIGURATION: OpenAI handles up to 2048 inputs per request cleanly
             CHUNK_SIZE = 2048
             for i in range(0, len(skills_to_fetch), CHUNK_SIZE):
                 chunk = skills_to_fetch[i : i + CHUNK_SIZE]
                 
-                logger.info("📡 Dispatching OpenAI chunk payload: items %d to %d", i, i + len(chunk))
+                logger.info("📡 [%s] Dispatching OpenAI chunk payload: items %d to %d", context, i, i + len(chunk))
+                
+                chunk_start = time.perf_counter()
                 response = await self.client.embeddings.create(
                     model=self.embedding_model,
                     input=chunk,
                     encoding_format="float",
                 )
+                chunk_elapsed = time.perf_counter() - chunk_start
+                logger.info("⏱️ [OPENAI API BATCH CHUNK] [%s] Latency for chunk size %d was %.4f seconds.", context, len(chunk), chunk_elapsed)
 
                 for idx, item in enumerate(response.data):
                     vector = item.embedding
                     skill_key = chunk[idx]
                     
-                    # Update runtime state and result dictionary simultaneously
+                    # 1. Update runtime state and result dictionary simultaneously
                     _GLOBAL_SKILL_CACHE[skill_key] = vector
                     embedded_skills_dict[skill_key] = vector
 
-            logger.info("✨ Successfully processed bulk batch embeddings for unique skills.")
+                    # 2. 🛠️ THE FIX: Persist the bulk skills directly to MongoDB
+                    if self.db is not None:
+                        try:
+                            if context == "JD":
+                                await self.db.Jd_Embeddings.update_one(
+                                    {"jd_raw_text": skill_key},
+                                    {"$set": {"jd_raw_text": skill_key, "jd_embeddings": vector}},
+                                    upsert=True
+                                )
+                            elif context == "CV":
+                                await self.db.Cv_Embeddings.update_one(
+                                    {"cv_raw_text": skill_key},
+                                    {"$set": {"cv_raw_text": skill_key, "cv_embeddings": vector}},
+                                    upsert=True
+                                )
+                        except Exception as db_exc:
+                            logger.error("Failed to write bulk skill '%s' to MongoDB cache: %s", skill_key, db_exc)
+
+            elapsed_time = time.perf_counter() - start_time
+            logger.info("✨ [SKILLS EMBEDDING TIMING] [%s] Total pipeline execution and DB saving for %d parsed skills completed in %.4f seconds.", context, len(skills), elapsed_time)
 
         except Exception as exc:
-            logger.error("❌ Failed batch skill embedding generation via OpenAI: %s", exc)
+            elapsed_time = time.perf_counter() - start_time
+            logger.error("❌ Failed batch skill embedding generation via OpenAI for [%s] after %.4f seconds: %s", context, elapsed_time, exc)
 
         return embedded_skills_dict
 
@@ -123,11 +152,15 @@ class SemanticEngine:
     # MACRO LAYER: FULL DOCUMENT EMBEDDING
     # ======================================================================
 
-    async def generate_embedding(self, text: str, is_skill: bool = True) -> list[float]:
+    async def generate_embedding(self, text: str, is_skill: bool = True, context: str = "UNKNOWN") -> list[float]:
         """
         Generate OpenAI embedding vector utilizing persistent and in-memory cache structures.
         Aligned to handle macro full-text fields (jd_raw_text and cv_raw_text).
+        Tracks detailed internal time constraints for raw data operations.
         """
+        start_time = time.perf_counter()  # ⏱️ Start raw text/single item timer
+        log_label = f"RAW_TEXT_{context}" if not is_skill else "SKILL_ITEM"
+
         if not text or not str(text).strip():
             logger.warning("Empty text passed to embedding. Returning zero vector.")
             return [0.0] * 1536
@@ -140,7 +173,8 @@ class SemanticEngine:
 
         # STEP 1: FAST RAM CACHE VERIFICATION
         if cleaned_text in _GLOBAL_SKILL_CACHE:
-            logger.info("✨ [RAM CACHE HIT] | Found memory vector for: '%s'", cleaned_text[:50])
+            elapsed_time = time.perf_counter() - start_time
+            logger.info("✨ [RAM CACHE HIT] | [%s] Found memory vector for: '%s...' in %.4f seconds.", log_label, cleaned_text[:50], elapsed_time)
             return _GLOBAL_SKILL_CACHE[cleaned_text]
 
         # STEP 2: PERSISTENT MONGODB LAYER LOOKUP
@@ -158,10 +192,12 @@ class SemanticEngine:
                 if existing_doc and vector_key in existing_doc:
                     vector = existing_doc[vector_key]
                     _GLOBAL_SKILL_CACHE[cleaned_text] = vector  # Prime fast RAM
-                    logger.info("💾 [MONGO CACHE HIT] | Found vector in Marketplace DB for: '%s'", cleaned_text[:50])
+                    
+                    elapsed_time = time.perf_counter() - start_time
+                    logger.info("💾 [MONGO CACHE HIT] | [%s] Resolved cached vector in %.4f seconds for: '%s...'", log_label, elapsed_time, cleaned_text[:50])
                     return vector
                 else:
-                    logger.info("🔍 [MONGO CACHE MISS] | No matching vector found in record field for: '%s'", cleaned_text[:50])
+                    logger.info("🔍 [MONGO CACHE MISS] | No matching vector found in record field for: '%s...'", cleaned_text[:50])
             except Exception as e:
                 logger.warning("Failed to look up persistent embedding in Marketplace MongoDB: %s", e)
         else:
@@ -174,13 +210,16 @@ class SemanticEngine:
 
         # STEP 4: OUTBOUND API CONCURRENT RETRIEVAL
         try:
-            logger.info("🌐 [OPENAI API CALL] | Dispatching live outbound request for: '%s'", cleaned_text[:50])
+            logger.info("🌐 [OPENAI API CALL] | Dispatching live outbound request for [%s]: '%s...'", log_label, cleaned_text[:50])
 
+            api_start = time.perf_counter()
             response = await self.client.embeddings.create(
                 model=self.embedding_model,
                 input=cleaned_text,
                 encoding_format="float",
             )
+            api_elapsed = time.perf_counter() - api_start
+            logger.info("⏱️ [OPENAI API HTTP RESPONSE] | Network round-trip for [%s] took %.4f seconds.", log_label, api_elapsed)
 
             if not response.data:
                 logger.warning("No data field returned in OpenAI response. Returning zero vector.")
@@ -207,14 +246,17 @@ class SemanticEngine:
                             {"$set": {"jd_raw_text": cleaned_text, "jd_embeddings": embedding}},
                             upsert=True
                         )
-                    logger.info("💾 [MONGO CACHE SAVE] | Saved fresh vector to Marketplace Collection for '%s'", cleaned_text[:50])
+                    logger.info("💾 [MONGO CACHE SAVE] | Saved fresh vector to Marketplace Collection for '%s...'", cleaned_text[:50])
                 except Exception as db_exc:
                     logger.error("Failed to write generated embedding to MongoDB cache: %s", db_exc)
 
+            elapsed_time = time.perf_counter() - start_time
+            logger.info("💾 [PIPELINE COMPLETE] | [%s] Vector generated, saved, and returned in total time of %.4f seconds.", log_label, elapsed_time)
             return embedding
 
         except Exception as exc:
-            logger.exception("Embedding generation failed: %s", str(exc))
+            elapsed_time = time.perf_counter() - start_time
+            logger.exception("❌ Embedding generation failed after %.4f seconds: %s", elapsed_time, str(exc))
             return [0.0] * 1536
 
     # ======================================================================
@@ -265,6 +307,7 @@ class SemanticEngine:
         existing_resume_embedding: list[float] | None = None,
     ) -> tuple[float, list[float], list[float]]:
         """ Top level domain validation pass used to benchmark macro document alignment """
+        macro_start_time = time.perf_counter()  # ⏱️ Start timer for total raw_text execution block
         try:
             jd_text = self._normalize_text(getattr(jd, "raw_text", "") or "")
             resume_text = self._normalize_text(getattr(resume, "raw_text", "") or "")
@@ -274,12 +317,12 @@ class SemanticEngine:
             if existing_jd_embedding is not None:
                 jd_emb_final = existing_jd_embedding
             else:
-                jd_emb_final = await self.generate_embedding(jd_text, is_skill=False)
+                jd_emb_final = await self.generate_embedding(jd_text, is_skill=False, context="JD")
 
             if existing_resume_embedding is not None:
                 resume_emb_final = existing_resume_embedding
             else:
-                resume_emb_final = await self.generate_embedding(resume_text, is_skill=False)
+                resume_emb_final = await self.generate_embedding(resume_text, is_skill=False, context="CV")
 
             semantic_score = self.compute_similarity_score(
                 jd_embedding=jd_emb_final,
@@ -288,11 +331,16 @@ class SemanticEngine:
                 resume_skill_text="FULL_RESUME_DOCUMENT",
             )
 
+            # 📊 Combined Total Time Summary Log for Raw Texts
+            total_macro_elapsed = time.perf_counter() - macro_start_time
+            logger.info("⏱️ [TOTAL TIME RAW_TEXT SUMMARY] Processing complete for both (JD + CV) raw text embeddings in %.4f seconds.", total_macro_elapsed)
+
             logger.info("FINAL DOCUMENT SEMANTIC SCORE => %.2f", semantic_score)
             return semantic_score, jd_emb_final, resume_emb_final
 
         except Exception as exc:
-            logger.exception("Semantic pipeline failed: %s", str(exc))
+            total_macro_elapsed = time.perf_counter() - macro_start_time
+            logger.exception("Semantic pipeline failed after %.4f seconds: %s", total_macro_elapsed, str(exc))
             return 0.0, [0.0] * 1536, [0.0] * 1536
 
     @staticmethod

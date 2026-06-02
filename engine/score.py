@@ -1,10 +1,18 @@
+"""
+score.py
+Core orchestration engine implementing the 3-tier hybrid escalation matching pipeline.
+Optimized with robust raw-text experience parsing and live database context synchronization.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
+import time  # ⏱️ High-resolution timing tracking
 import unicodedata
 from functools import lru_cache
+from typing import Any
 import numpy as np
 
 from config import settings
@@ -32,16 +40,41 @@ class MatchScoreEngine:
         text = re.sub(r"[\u200b\u200c\u200d]", " ", text)
         return " " + " ".join(text.split()) + " "
 
+    def _parse_experience(self, val: Any) -> float:
+        """
+        Robust string/numeric processing engine to clean and extract exact numerical 
+        experience values from dirty parameters (e.g. '5+ years', '3.5', 'Fresher').
+        Ens ensures comparison gates work flawlessly without throwing ValueErrors.
+        """
+        if val is None:
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        
+        cleaned = str(val).strip().lower()
+        if not cleaned or cleaned in ["none", "null", "not specified", "fresher"]:
+            return 0.0
+            
+        try:
+            return float(cleaned)
+        except ValueError:
+            pass
+            
+        # Fallback regex parsing to extract first clean numerical digit block found
+        match = re.search(r"(\d+(?:\.\d+)?)", cleaned)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return 0.0
+        return 0.0
+
     @staticmethod
     @lru_cache(maxsize=5000)
     def _compile_flexible_pattern(skill_lower: str):
         """
         Compiles a robust regex pattern handling word boundaries safely,
         even for skills containing special characters (e.g., .net, c++, c#).
-        
-        Dynamically adjusts to handle variation footprints such as version matching 
-        (e.g., 'Java 8' matching 'Java') and javascript suffix omissions 
-        (e.g., 'AngularJS' matching 'Angular') with zero hardcoding.
         """
         cleaned = skill_lower.strip()
         
@@ -53,7 +86,6 @@ class MatchScoreEngine:
             escaped = re.escape(cleaned).replace(r"\ ", r"[\s\-\.\/_]*")
             
         # 2. Handle trailing numeric versions dynamically (e.g., 'java 8' can fallback to match 'java')
-        # We transform the pattern to allow the base token or the token with its version number
         if re.search(r"\s+\d+$", cleaned):
             base_token = re.sub(r"\s+\d+$", "", cleaned).strip()
             version_token = re.search(r"\d+$", cleaned).group()
@@ -80,25 +112,21 @@ class MatchScoreEngine:
     def _verify_raw_text_fallback(self, skill: str, text: str) -> bool:
         """
         Universal strict boundary check preventing substring pollution (e.g., 'Java' inside 'JavaScript')
-        and split-word pollution (e.g., matching 'MS SQL' because 'ms access' and 'sql server' exist).
+        and split-word pollution.
         """
         skill_lower = skill.strip().lower()
         if not skill_lower:
             return False
 
-        # 1. Attempt the primary compiled flexible regex pattern match (unbroken consecutive phrase)
         try:
             if self._compile_flexible_pattern(skill_lower).search(text):
                 return True
         except Exception as e:
             logger.warning("Regex failed for %s: %s", skill_lower, e)
 
-        # 2. Tight Spatial Guard: If it's a multi-word phrase and missed the exact consecutive sequence
-        # check above, DO NOT allow it to split tokens across the resume. Push it straight to Tier 2 vectors.
         if " " in skill_lower:
             return False
 
-        # 3. Fallback whole-word assertion for single-token fallback safety
         tokens = [t for t in re.findall(r'[a-z0-9]+', skill_lower) if len(t) > 1]
         if not tokens:
             return False
@@ -123,11 +151,61 @@ class MatchScoreEngine:
         candidate_name = getattr(resume, "candidate_name", "Unknown Candidate")
         logger.info("⚡ STARTING MATCH SCORE PIPELINE | Candidate: %s", candidate_name)
 
+        # 🛠️ THE FIX: Dynamically link database connection pool context to semantic layer if unassigned
+        if database_service and not self.semantic_engine.db:
+            resolved_db = getattr(database_service, "db", getattr(database_service, "client", None))
+            if resolved_db:
+                self.semantic_engine.db = resolved_db
+                logger.info("💾 [ENGINE AUTO-SYNC] Successfully paired active database driver to Semantic Engine layer.")
+
         # Ensure min and max experience structural values exist inside the JD metadata tracking block
         if isinstance(jd.metadata, dict):
             jd.metadata["min_experience"] = getattr(jd, "min_experience_years", 0.0)
             jd.metadata["max_experience"] = getattr(jd, "max_experience_years", 0.0)
 
+        # =====================================================================================
+        # 🛑 UPFRONT FORCED SKILL EMBEDDING PHASES (Guarantees execution for all pipeline passes)
+        # =====================================================================================
+        jd_skills_vectors = {}
+        cv_skills_vectors = {}
+        
+        resume_skills = getattr(resume, "primary_skills", []) or []
+        resume_skills_list = list(set(str(s).strip() for s in resume_skills if s))
+        raw_jd_skills = (jd.primary_skills or []) + (jd.good_to_have_skills or [])
+
+        if database_service and contest_id and js_id:
+            logger.info("📡 [UPFRONT EMBEDDING] Initiating mandatory phase-level skill vectorization caches...")
+            skills_summary_start = time.perf_counter()
+
+            try:
+                logger.info("📡 Checking Jd_Embeddings cache collection for contestId: %s", contest_id)
+                jd_skills_vectors = await database_service.get_or_create_jd_skills_meta(
+                    semantic_engine=self.semantic_engine,
+                    contest_id=contest_id,
+                    raw_jd_skills=raw_jd_skills
+                )
+                logger.info("📦 JD Skills Embedding Resolution complete. Found keys: %s", list(jd_skills_vectors.keys()))
+            except Exception as jd_emb_ex:
+                logger.error("❌ Failed resolving upfront JD skill embeddings: %s", str(jd_emb_ex))
+
+            try:
+                logger.info("📡 Checking Cv_Embeddings cache collection for contestId: %s, jsId: %s", contest_id, js_id)
+                cv_skills_vectors = await database_service.get_or_create_cv_skills_meta(
+                    semantic_engine=self.semantic_engine,
+                    contest_id=contest_id,
+                    js_id=js_id,
+                    raw_cv_skills=resume_skills_list
+                )
+                logger.info("📦 CV Skills Embedding Resolution complete. Found keys: %s", list(cv_skills_vectors.keys()))
+            except Exception as cv_emb_ex:
+                logger.error("❌ Failed resolving upfront CV skill embeddings: %s", str(cv_emb_ex))
+
+            total_skills_elapsed = time.perf_counter() - skills_summary_start
+            logger.info("⏱️ [TOTAL TIME SKILLS SUMMARY] Upfront processing complete for both (JD + CV) parsed skills arrays in %.4f seconds.", total_skills_elapsed)
+        else:
+            logger.warning("⚠️ Upfront caching skipped: Database service instances or orchestration metadata IDs are unassigned.")
+
+        # Execute structural scoring baseline mappings
         structural = self.structural_engine.compute(jd=jd, resume=resume)
 
         # Base tracking lists from structural engine (Pre-processed initial matches)
@@ -172,43 +250,17 @@ class MatchScoreEngine:
         # ---------------- TIER 2: HYBRID SEMANTIC MATCHING (VECTOR EMBEDDINGS) ----------------
         logger.info("🤖 STARTING TIER 2 EVALUATION: Vector Space Cosine Similarity Matching")
 
-        resume_skills = getattr(resume, "primary_skills", []) or []
-        resume_skills_list = list(set(str(s).strip() for s in resume_skills if s))
-
-        if resume_skills_list and (missing_primary or missing_good) and database_service and contest_id and js_id:
-            logger.info("⚡ Executing isolated micro-skills batch lookup via database persistence layer.")
+        if (missing_primary or missing_good) and jd_skills_vectors and cv_skills_vectors:
+            logger.info("⚡ Executing high-performance matrix vector space comparisons using pre-fetched upfront skill embeddings.")
             
-            logger.info("📡 Checking Jd_Embeddings cache collection for contestId: %s", contest_id)
-            jd_skills_vectors = await database_service.get_or_create_jd_skills_meta(
-                semantic_engine=self.semantic_engine,
-                contest_id=contest_id,
-                raw_jd_skills=(jd.primary_skills or []) + (jd.good_to_have_skills or [])
-            )
-            logger.info("📦 JD Skills Embedding Resolution complete. Found keys: %s", list(jd_skills_vectors.keys()))
-            
-            logger.info("📡 Checking Cv_Embeddings cache collection for contestId: %s, jsId: %s", contest_id, js_id)
-            cv_skills_vectors = await database_service.get_or_create_cv_skills_meta(
-                semantic_engine=self.semantic_engine,
-                contest_id=contest_id,
-                js_id=js_id,
-                raw_cv_skills=resume_skills_list
-            )
-            logger.info("📦 CV Skills Embedding Resolution complete. Found keys: %s", list(cv_skills_vectors.keys()))
-
             # 🛠️ Set strictly to 70% matching floor requirement
             DYNAMIC_INFERENCE_FLOOR = 0.70
 
             # 🛠️ PRE-CONSTRUCT 2D NUMPY MATRIX FOR LIGHTNING-FAST BATCH CALCULATIONS
-            if cv_skills_vectors:
-                cv_skill_names = list(cv_skills_vectors.keys())
-                # Stack individual arrays into a single 2D float64 matrix [N x Dimensions]
-                cv_matrix = np.array([cv_skills_vectors[name] for name in cv_skill_names], dtype=np.float64)
-                # Compute L2 norms down columns for clean vectorized division stability
-                cv_norms = np.linalg.norm(cv_matrix, axis=1)
-                # Safeguard against zero division modifications
-                cv_norms[cv_norms == 0] = 1.0
-            else:
-                cv_skill_names, cv_matrix, cv_norms = [], None, None
+            cv_skill_names = list(cv_skills_vectors.keys())
+            cv_matrix = np.array([cv_skills_vectors[name] for name in cv_skill_names], dtype=np.float64)
+            cv_norms = np.linalg.norm(cv_matrix, axis=1)
+            cv_norms[cv_norms == 0] = 1.0
 
             # Process Missing Primary Skills through High-Performance Matrix Vector Space Comparisons
             for skill in missing_primary[:]:
@@ -218,17 +270,14 @@ class MatchScoreEngine:
                     logger.warning("⚠️ Missing vectors for primary skill: '%s' (vector in JD map: %s, CV vectors present: %s)", skill, bool(vec), cv_matrix is not None)
                     continue
 
-                # Turn single requirement line into float64 tracking format
                 jd_vec = np.array(vec, dtype=np.float64)
                 jd_norm = np.linalg.norm(jd_vec)
                 if jd_norm == 0:
                     jd_norm = 1.0
 
-                # Vector-Matrix Product: Computes dot products for ALL skills instantly in C-level execution
                 dot_products = np.dot(cv_matrix, jd_vec)
                 similarities = dot_products / (cv_norms * jd_norm)
 
-                # Track best alignment index boundaries safely
                 best_idx = np.argmax(similarities)
                 best_score = float(similarities[best_idx])
                 best_match_skill = cv_skill_names[best_idx]
@@ -259,17 +308,14 @@ class MatchScoreEngine:
                     logger.warning("⚠️ Missing vectors for good-to-have skill: '%s' (vector in JD map: %s, CV vectors present: %s)", skill, bool(vec), cv_matrix is not None)
                     continue
 
-                # Turn single requirement line into float64 tracking format
                 jd_vec = np.array(vec, dtype=np.float64)
                 jd_norm = np.linalg.norm(jd_vec)
                 if jd_norm == 0:
                     jd_norm = 1.0
 
-                # Vector-Matrix Product: Computes dot products for ALL skills instantly in C-level execution
                 dot_products = np.dot(cv_matrix, jd_vec)
                 similarities = dot_products / (cv_norms * jd_norm)
 
-                # Track best alignment index boundaries safely
                 best_idx = np.argmax(similarities)
                 best_score = float(similarities[best_idx])
                 best_match_skill = cv_skill_names[best_idx]
@@ -292,13 +338,12 @@ class MatchScoreEngine:
                         skill, best_score, best_match_skill, DYNAMIC_INFERENCE_FLOOR
                     )
         else:
-            logger.info("⏭️ SKIPPING TIER 2: No parsed candidate primary skills profile array, missing engine database orchestration instances, or requirements met.")
+            logger.info("⏭️ SKIPPING TIER 2 MATCHING CALCULATIONS: Target missing skill array empty or upfront embedding matrices unavailable.")
 
         # ---------------- TIER 3: LLM IMPLIED ENGINE (CONTEXT DEEP SCAN - FORCED EXECUTION) ----------------
         if settings.llm_implied_skills_enabled:
             logger.info("🔮 STARTING TIER 3 EVALUATION (FORCED MODE): LLM Implied Skill Deep Context Scan Engine")
             
-            # Re-calculating remaining missing lists to ensure accuracy for the LLM prompt
             still_miss_p = [s for s in (jd.primary_skills or []) if s not in matched_primary]
             still_miss_g = [s for s in (jd.good_to_have_skills or []) if s not in matched_good]
             
@@ -327,14 +372,14 @@ class MatchScoreEngine:
         total_p = len(jd.primary_skills or []) or 1
         total_g = len(jd.good_to_have_skills or []) or 1
 
-        # 🛠️ Skills calculated proportionally based on your exact specifications
         p_score = (len(matched_primary) / total_p) * 55.0
         g_score = (len(matched_good) / total_g) * 20.0
 
-        # 🛠️ EXPERIENCE RULE GATE: Strict 20 Points All-or-Nothing
-        req_exp = float(jd.min_experience_years or 0)
-        cand_exp = float(resume.total_experience_years or 0)
+        # 🛠️ THE FIX: Safe normalized extraction prevent float conversion discrepancies on structural years rules
+        req_exp = self._parse_experience(getattr(jd, "min_experience_years", 0.0))
+        cand_exp = self._parse_experience(getattr(resume, "total_experience_years", 0.0))
 
+        # Perform clean numeric comparison against structural bounds with safe rounding threshold logic
         if cand_exp >= req_exp:
             exp_score = 20.0
             exp_pct = 100.0
@@ -358,7 +403,7 @@ class MatchScoreEngine:
                 loc_score = 0.0
                 loc_match_pct = 0.0
 
-        # Aggregate raw scores together up to a absolute combined 100.0 pool maximum boundary
+        # Aggregate raw scores together up to an absolute combined 100.0 pool maximum boundary
         overall = min(round(p_score + g_score + exp_score + loc_score, 1), 100.0)
 
         # ---------------- COMPREHENSIVE PIPELINE AUDIT LOG ----------------
@@ -378,9 +423,9 @@ class MatchScoreEngine:
             "   🔹 TIER 2    (Vector Embedding Synthetics): %s\n"
             "   🔹 TIER 3    (LLM Implied Context Scan)   : %s\n"
             "----------------------------------------------------------------------\n"
-            "🎯 Final Primary Skills Matched       : %s\n"
+            "🎯 Final Primary Skills Matched         : %s\n"
             "❌ Remaining Missing Primary           : %s\n"
-            "🌟 Final Good-To-Have Skills Matched   : %s\n"
+            "🌟 Final Good-To-Have Skills Matched  : %s\n"
             "❌ Remaining Missing Good-To-Have     : %s\n"
             "💼 Calculated Experience Allocation    : %.2f / 20.0 (Total Years: %.1f, Required: %.1f)\n"
             "📍 Calculated Location Allocation      : %.2f / 5.0\n"
@@ -433,13 +478,13 @@ class MatchScoreEngine:
             if existing_jd_embedding:
                 return existing_jd_embedding
             logger.info("📡 [TEXT EMBEDDING CACHE MISS] Generating fresh macro JD text embedding via OpenAI...")
-            return await self.semantic_engine.generate_embedding(jd_text, is_skill=False) if jd_text else []
+            return await self.semantic_engine.generate_embedding(jd_text, is_skill=False, context="JD") if jd_text else []
 
         async def fetch_resume_macro_embedding() -> list[float]:
             if existing_resume_embedding:
                 return existing_resume_embedding
             logger.info("📡 [TEXT EMBEDDING CACHE MISS] Generating fresh macro CV text embedding for Candidate: %s via OpenAI...", candidate_name)
-            return await self.semantic_engine.generate_embedding(resume_text, is_skill=False) if resume_text else []
+            return await self.semantic_engine.generate_embedding(resume_text, is_skill=False, context="CV") if resume_text else []
 
         jd_emb, res_emb = await asyncio.gather(
             fetch_jd_macro_embedding(),
