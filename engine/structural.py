@@ -184,11 +184,6 @@ class StructuralScorer:
         matched = []
         missing = []
 
-        # Prepare normalized raw text for a deep scan fallback lookup
-        clean_raw_text = ""
-        if raw_text:
-            clean_raw_text = re.sub(r"[\s\.\-\/]+", "", raw_text.lower())
-
         for required_skill in required_skills:
             normalized_required = self._normalize_skill(required_skill)
             found_match = False
@@ -209,24 +204,26 @@ class StructuralScorer:
                     if normalized_required == "java" and "javascript" in normalized_candidate:
                         continue
 
-                    # Allow token mapping only if characters exceed basic short abbreviations
-                    if len(normalized_required) > 3 and (
+                    # Allow token mapping only if characters exceed short designations (e.g., > 4 chars)
+                    if len(normalized_required) > 4 and (
                         normalized_required in normalized_candidate
                         or normalized_candidate in normalized_required
                     ):
                         found_match = True
                         break
 
-            # 3. Raw Document Text Fallback Lookup (Catches unparsed tokens like REST API)
-            if not found_match and clean_raw_text:
-                if normalized_required == "java" and "javascript" in clean_raw_text:
-                    # Check if 'java' exists independently outside of 'javascript' instances
-                    # Strip out 'javascript' temporarily to see if a standalone 'java' footprint remains
-                    stripped_raw = clean_raw_text.replace("javascript", "")
-                    if normalized_required in stripped_raw:
+            # 3. Raw Document Text Fallback Lookup (Safe Lookaround Word Boundary Check)
+            if not found_match and raw_text:
+                if self._test_raw_text_boundary(required_skill, raw_text):
+                    # Edge-case confirmation: If required is 'Java', make sure it's not just a JavaScript hit
+                    if normalized_required == "java":
+                        # Strip out 'javascript' temporarily to see if a standalone 'java' footprint remains
+                        clean_lower = raw_text.lower()
+                        stripped_raw = clean_lower.replace("javascript", "")
+                        if re.search(r"(?<![a-zA-Z0-9])java(?![a-zA-Z0-9])", stripped_raw):
+                            found_match = True
+                    else:
                         found_match = True
-                elif normalized_required in clean_raw_text:
-                    found_match = True
 
             if found_match:
                 matched.append(required_skill)
@@ -319,7 +316,7 @@ class StructuralScorer:
         return 0.0
 
     # ==========================================================================
-    # SKILL NORMALIZATION
+    # HELPER UTILITIES
     # ==========================================================================
 
     @staticmethod
@@ -334,3 +331,21 @@ class StructuralScorer:
         skill = skill.strip().lower()
         skill = re.sub(r"[\s\.\-\/]+", "", skill)
         return skill
+
+    @staticmethod
+    def _test_raw_text_boundary(skill: str, raw_text: str) -> bool:
+        """
+        Tests if a given raw required skill exists inside un-smashed raw text
+        using rigid regex boundaries. Escaping safely handles symbols like C++.
+        """
+        if not skill or not raw_text:
+            return False
+
+        # Escape characters to safely process strings like C++, .NET, or Node.js
+        escaped_skill = re.escape(skill.strip().lower())
+
+        # Lookarounds make sure keyword isn't bounded by alphanumeric neighbors
+        # (e.g., prevents matching 'go' inside 'ongoing' or 'category')
+        pattern = rf"(?<![a-zA-Z0-9]){escaped_skill}(?![a-zA-Z0-9])"
+
+        return bool(re.search(pattern, raw_text.lower()))

@@ -43,8 +43,8 @@ class MatchScoreEngine:
     def _parse_experience(self, val: Any) -> float:
         """
         Robust string/numeric processing engine to clean and extract exact numerical 
-        experience values from dirty parameters (e.g. '5+ years', '3.5', 'Fresher').
-        Ens ensures comparison gates work flawlessly without throwing ValueErrors.
+        experience values from dirty parameters (e.g. '5+ years', '3.5').
+        Ensures comparison gates work flawlessly without throwing ValueErrors.
         """
         if val is None:
             return 0.0
@@ -52,7 +52,7 @@ class MatchScoreEngine:
             return float(val)
         
         cleaned = str(val).strip().lower()
-        if not cleaned or cleaned in ["none", "null", "not specified", "fresher"]:
+        if not cleaned or cleaned in ["none", "null", "not specified"]:
             return 0.0
             
         try:
@@ -142,8 +142,6 @@ class MatchScoreEngine:
         self,
         jd: ParsedJd,
         resume: ParsedResume,
-        existing_jd_embedding=None,
-        existing_resume_embedding=None,
         database_service=None,
         contest_id: str | None = None,
         js_id: str | None = None
@@ -179,26 +177,32 @@ class MatchScoreEngine:
 
             try:
                 logger.info("📡 Checking Jd_Embeddings cache collection for contestId: %s", contest_id)
-                jd_skills_vectors = await database_service.get_or_create_jd_skills_meta(
+                res_jd_vecs = await database_service.get_or_create_jd_skills_meta(
                     semantic_engine=self.semantic_engine,
                     contest_id=contest_id,
                     raw_jd_skills=raw_jd_skills
                 )
+                # ⚡ FIXED: Add defensive dictionary check and enforce fallback assignment
+                jd_skills_vectors = res_jd_vecs if isinstance(res_jd_vecs, dict) else {}
                 logger.info("📦 JD Skills Embedding Resolution complete. Found keys: %s", list(jd_skills_vectors.keys()))
             except Exception as jd_emb_ex:
                 logger.error("❌ Failed resolving upfront JD skill embeddings: %s", str(jd_emb_ex))
+                jd_skills_vectors = {}
 
             try:
                 logger.info("📡 Checking Cv_Embeddings cache collection for contestId: %s, jsId: %s", contest_id, js_id)
-                cv_skills_vectors = await database_service.get_or_create_cv_skills_meta(
+                res_cv_vecs = await database_service.get_or_create_cv_skills_meta(
                     semantic_engine=self.semantic_engine,
                     contest_id=contest_id,
                     js_id=js_id,
                     raw_cv_skills=resume_skills_list
                 )
+                # ⚡ FIXED: Add defensive dictionary check and enforce fallback assignment
+                cv_skills_vectors = res_cv_vecs if isinstance(res_cv_vecs, dict) else {}
                 logger.info("📦 CV Skills Embedding Resolution complete. Found keys: %s", list(cv_skills_vectors.keys()))
             except Exception as cv_emb_ex:
                 logger.error("❌ Failed resolving upfront CV skill embeddings: %s", str(cv_emb_ex))
+                cv_skills_vectors = {}
 
             total_skills_elapsed = time.perf_counter() - skills_summary_start
             logger.info("⏱️ [TOTAL TIME SKILLS SUMMARY] Upfront processing complete for both (JD + CV) parsed skills arrays in %.4f seconds.", total_skills_elapsed)
@@ -217,11 +221,13 @@ class MatchScoreEngine:
         tier2_matches = []
         tier3_matches = []
 
+        # Extract remaining missing skills after the updated structural execution pass
         missing_primary = [s for s in (jd.primary_skills or []) if s not in matched_primary]
         missing_good = [s for s in (jd.good_to_have_skills or []) if s not in matched_good]
 
-        norm_text = self._normalize_raw_text(getattr(resume, "raw_text", "") or "")
-        resume_text = str(resume.raw_text or "").strip()
+        # Use original un-mutated raw text context to allow clean lookarounds inside fallback validations
+        raw_cv_text = getattr(resume, "raw_text", "") or ""
+        norm_text = self._normalize_raw_text(raw_cv_text)
 
         # ---------------- TIER 1: RAW TEXT FALLBACK (KEYWORD MATCHING) ----------------
         logger.info("🎯 STARTING TIER 1 EVALUATION: Keyword & Regex Fallback Validation")
@@ -250,11 +256,12 @@ class MatchScoreEngine:
         # ---------------- TIER 2: HYBRID SEMANTIC MATCHING (VECTOR EMBEDDINGS) ----------------
         logger.info("🤖 STARTING TIER 2 EVALUATION: Vector Space Cosine Similarity Matching")
 
+        # ⚡ FIXED: Add an explicit emptiness validation check to prevent NumPy generation panics on zero skill elements
         if (missing_primary or missing_good) and jd_skills_vectors and cv_skills_vectors:
             logger.info("⚡ Executing high-performance matrix vector space comparisons using pre-fetched upfront skill embeddings.")
             
-            # 🛠️ Set strictly to 70% matching floor requirement
-            DYNAMIC_INFERENCE_FLOOR = 0.70
+            # 🛠️ Updated to reflect consistent 0.45 threshold floor requirements
+            DYNAMIC_INFERENCE_FLOOR = 0.45
 
             # 🛠️ PRE-CONSTRUCT 2D NUMPY MATRIX FOR LIGHTNING-FAST BATCH CALCULATIONS
             cv_skill_names = list(cv_skills_vectors.keys())
@@ -350,8 +357,9 @@ class MatchScoreEngine:
             logger.info("🔮 SENDING TO LLM | Remaining Missing Primary: %s | Missing Good-To-Have: %s", still_miss_p, still_miss_g)
 
             if still_miss_p or still_miss_g:
+                # Use standard raw document text context to prevent conversion errors inside semantic prompts
                 ref = await self.refinement_engine.detect_implied_skills(
-                    norm_text, still_miss_p, still_miss_g
+                    raw_cv_text, still_miss_p, still_miss_g
                 )
 
                 for s in ref.implied_primary_matches:
@@ -375,7 +383,7 @@ class MatchScoreEngine:
         p_score = (len(matched_primary) / total_p) * 55.0
         g_score = (len(matched_good) / total_g) * 20.0
 
-        # 🛠️ THE FIX: Safe normalized extraction prevent float conversion discrepancies on structural years rules
+        # Safe normalized extraction prevents float conversion discrepancies on structural years rules
         req_exp = self._parse_experience(getattr(jd, "min_experience_years", 0.0))
         cand_exp = self._parse_experience(getattr(resume, "total_experience_years", 0.0))
 
@@ -470,25 +478,4 @@ class MatchScoreEngine:
             res.jdMetadata["min_experience"] = getattr(jd, "min_experience_years", 0.0)
             res.jdMetadata["max_experience"] = getattr(jd, "max_experience_years", 0.0)
 
-        jd_text = str(jd.raw_text or "").strip()
-        resume_text = str(resume.raw_text or "").strip()
-
-        # 🛠️ PARALLELIZE INTERNET I/O FOR FULL-TEXT EMBEDDINGS
-        async def fetch_jd_macro_embedding() -> list[float]:
-            if existing_jd_embedding:
-                return existing_jd_embedding
-            logger.info("📡 [TEXT EMBEDDING CACHE MISS] Generating fresh macro JD text embedding via OpenAI...")
-            return await self.semantic_engine.generate_embedding(jd_text, is_skill=False, context="JD") if jd_text else []
-
-        async def fetch_resume_macro_embedding() -> list[float]:
-            if existing_resume_embedding:
-                return existing_resume_embedding
-            logger.info("📡 [TEXT EMBEDDING CACHE MISS] Generating fresh macro CV text embedding for Candidate: %s via OpenAI...", candidate_name)
-            return await self.semantic_engine.generate_embedding(resume_text, is_skill=False, context="CV") if resume_text else []
-
-        jd_emb, res_emb = await asyncio.gather(
-            fetch_jd_macro_embedding(),
-            fetch_resume_macro_embedding()
-        )
-
-        return res, jd_emb, res_emb
+        return res

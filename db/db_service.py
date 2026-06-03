@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -47,11 +47,6 @@ class DatabaseService:
     @property
     def inhouse_jd_parser_db(self):
         return self.client[settings.mongodb_db_jd_parser]
-
-    @property
-    def inhouse_resume_parser_db(self):
-        # ⚡ FIXED: Pointing directly to the Marketplace DB since separate DB doesn't exist
-        return self.client[settings.mongodb_db_marketplace]
 
     # ==========================================================
     # ID NORMALIZER
@@ -118,7 +113,6 @@ class DatabaseService:
         if not isinstance(target_js_id, ObjectId):
             raise self.InvalidIdError(f"Invalid jsId format: {js_id}")
 
-        # ⚡ FIXED: Pointing primary target directly to Marketplace.jobSeekerProfile
         resume_doc = await self.marketplace_db.jobSeekerProfile.find_one(
             {"_id": target_js_id}
         )
@@ -132,14 +126,16 @@ class DatabaseService:
     # ==========================================================
     # CV METADATA
     # ==========================================================
-    async def get_cv_meta_metadata(self, contest_id: str, recruiter_id: str, js_id: str) -> str:
+    async def get_cv_meta_metadata(self, contest_id: str, js_id: str) -> str:
+        """
+        Fetches the CV URL from recruiterAddProfiles strictly mapping 
+        contestId and nested jobseekerDetails.jsId without recruiterId filter.
+        """
         target_contest_id = self._normalize_and_convert_id(contest_id)
-        target_recruiter_id = self._normalize_and_convert_id(recruiter_id)
         target_js_id = self._normalize_and_convert_id(js_id)
 
         profile_doc = await self.marketplace_db.recruiterAddProfiles.find_one({
             "contestId": target_contest_id,
-            "recruiterId": target_recruiter_id,
             "jobseekerDetails.jsId": target_js_id
         })
 
@@ -147,7 +143,6 @@ class DatabaseService:
             raise self.DocumentNotFoundError("Recruiter profile mapping not found")
 
         root_cv = profile_doc.get("cv")
-
         if root_cv:
             if isinstance(root_cv, dict):
                 return root_cv.get("url") or root_cv.get("secureUrl") or root_cv.get("s3Url") or ""
@@ -158,170 +153,135 @@ class DatabaseService:
             for item in jobseeker_details:
                 if not isinstance(item, dict):
                     continue
-                    
+
                 item_js_id = self._normalize_and_convert_id(item.get("jsId"))
-                if item_js_id != target_js_id:
+                if str(item_js_id) != str(target_js_id):
                     continue
 
                 cv_data = item.get("cv") or item.get("resume") or item.get("cvUrl")
 
                 if isinstance(cv_data, dict):
                     return cv_data.get("url") or cv_data.get("secureUrl") or cv_data.get("s3Url") or ""
-                return str(cv_data or "")
+                return str(cv_data or "").strip()
 
-        raise self.DocumentNotFoundError("CV metadata missing inside profile map")
-
-    # ==========================================================
-    # CACHE FUNCTIONS
-    # ==========================================================
-    async def get_jd_cache(self, contest_id: str) -> dict:
-        target_contest_id = self._normalize_and_convert_id(contest_id)
-
-        cache_doc = await self.marketplace_db.Jd_Embeddings.find_one(
-            {"contestId": {"$in": [target_contest_id, str(target_contest_id)]}},
-            {"jd_embeddings": 1, "jd_raw_text": 1, "_id": 0}
-        )
-
-        return {
-            "embedding": cache_doc.get("jd_embeddings") if cache_doc else None,
-            "raw_text": cache_doc.get("jd_raw_text", "") if cache_doc else ""
-        }
-
-    async def cache_jd_data(self, contest_id: str, embeddings: List[float], raw_text: str) -> None:
-        target_contest_id = self._normalize_and_convert_id(contest_id)
-
-        await self.marketplace_db.Jd_Embeddings.update_one(
-            {"contestId": target_contest_id},
-            {
-                "$set": {
-                    "jd_embeddings": embeddings,
-                    "jd_raw_text": raw_text,
-                    "updatedAt": datetime.now(timezone.utc)
-                },
-                "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
-            },
-            upsert=True
-        )
-
-    async def get_cv_cache(self, contest_id: str, js_id: str) -> dict:
-        target_contest_id = self._normalize_and_convert_id(contest_id)
-        target_js_id = self._normalize_and_convert_id(js_id)
-
-        cache_doc = await self.marketplace_db.Cv_Embeddings.find_one(
-            {
-                "contestId": {"$in": [target_contest_id, str(target_contest_id)]},
-                "jsId": {"$in": [target_js_id, str(target_js_id)]}
-            },
-            {"cv_embeddings": 1, "cv_raw_text": 1, "_id": 0}
-        )
-
-        return {
-            "embedding": cache_doc.get("cv_embeddings") if cache_doc else None,
-            "raw_text": cache_doc.get("cv_raw_text", "") if cache_doc else ""
-        }
-
-    async def cache_cv_data(self, contest_id: str, js_id: str, embeddings: List[float], raw_text: str) -> None:
-        target_contest_id = self._normalize_and_convert_id(contest_id)
-        target_js_id = self._normalize_and_convert_id(js_id)
-
-        await self.marketplace_db.Cv_Embeddings.update_one(
-            {"contestId": target_contest_id, "jsId": target_js_id},
-            {
-                "$set": {
-                    "cv_embeddings": embeddings,
-                    "cv_raw_text": raw_text,
-                    "updatedAt": datetime.now(timezone.utc)
-                },
-                "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
-            },
-            upsert=True
-        )
+        raise self.DocumentNotFoundError("CV metadata missing inside profile map array")
 
     # ==========================================================
     # MICRO-SKILL OBJECT EMBEDDING COMPONENT INTEGRATIONS
     # ==========================================================
     async def get_or_create_jd_skills_meta(
-        self, semantic_engine: Any, contest_id: str, raw_jd_skills: List[str]
-    ) -> Dict[str, List[float]] | None:
+        self,
+        semantic_engine: Any,
+        contest_id: str,
+        raw_jd_skills: List[str]
+    ) -> Dict[str, List[float]]:
         """
-        Ensures JD requirements are batch embedded and cached.
-        Explicitly saves and returns None (null) if the skills list is empty.
+        Ensures JD skill embeddings are generated once and cached.
+        Saves an explicit null marker to the DB if no skills exist to prevent redundant runs.
         """
         try:
             query_id = self._normalize_and_convert_id(contest_id)
-            doc = await self.marketplace_db.Jd_Embeddings.find_one({"contestId": query_id})
-            
-            # Check if key exists in document. If it is None, return None.
+
+            doc = await self.marketplace_db.Jd_Embeddings.find_one(
+                {"contestId": query_id},
+                {"jd_skills_embeddings": 1}
+            )
+
             if doc and "jd_skills_embeddings" in doc:
-                logger.info("✨ [MONGO JD SKILLS HIT] | Loaded field entry from Jd_Embeddings.")
-                return doc["jd_skills_embeddings"]
+                logger.info("✨ [MONGO JD SKILLS HIT] | contestId=%s", contest_id)
+                cached_vectors = doc.get("jd_skills_embeddings")
+                # Downstream execution layer safety check
+                return cached_vectors if isinstance(cached_vectors, dict) else {}
 
             fresh_vectors = None
             if raw_jd_skills:
                 logger.info("🔍 [MONGO JD SKILLS MISS] | Generating bulk OpenAI vectors")
                 fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_jd_skills)
             else:
-                logger.warning("⚠️ No JD skills available. Saving null mapping to DB.")
+                logger.warning("⚠️ No JD skills available. Saving null cache marker.")
+                fresh_vectors = None  # Saves as JSON null in MongoDB
 
+            now = datetime.now(timezone.utc)
             await self.marketplace_db.Jd_Embeddings.update_one(
                 {"contestId": query_id},
                 {
                     "$set": {
-                        "jd_skills_embeddings": fresh_vectors, # Storing None as null
-                        "updatedAt": datetime.now(timezone.utc)
+                        "jd_skills_embeddings": fresh_vectors,
+                        "updatedAt": now
                     },
-                    "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+                    "$setOnInsert": {
+                        "createdAt": now
+                    }
                 },
                 upsert=True
             )
-            return fresh_vectors
+            
+            return fresh_vectors if fresh_vectors is not None else {}
 
         except Exception as e:
-            logger.error("❌ Database tracking failed in get_or_create_jd_skills_meta: %s", e)
-            return None
+            logger.exception("❌ get_or_create_jd_skills_meta failed: %s", e)
+            return {}
 
     async def get_or_create_cv_skills_meta(
-        self, semantic_engine: Any, contest_id: str, js_id: str, raw_cv_skills: List[str]
-    ) -> Dict[str, List[float]] | None:
+        self,
+        semantic_engine: Any,
+        contest_id: str,
+        js_id: str,
+        raw_cv_skills: List[str]
+    ) -> Dict[str, List[float]]:
         """
-        Ensures Candidate profile components are batch embedded and cached.
-        Explicitly saves and returns None (null) if the skills list is empty.
+        Ensures CV skill embeddings are generated once and cached.
+        Saves an explicit null marker to the DB if no skills exist to prevent redundant runs.
         """
         try:
             query_contest_id = self._normalize_and_convert_id(contest_id)
             query_js_id = self._normalize_and_convert_id(js_id)
 
-            doc = await self.marketplace_db.Cv_Embeddings.find_one({
-                "contestId": query_contest_id, "jsId": query_js_id
-            })
-            
+            doc = await self.marketplace_db.Cv_Embeddings.find_one(
+                {
+                    "contestId": query_contest_id,
+                    "jsId": query_js_id
+                },
+                {"cv_skills_embeddings": 1}
+            )
+
             if doc and "cv_skills_embeddings" in doc:
-                logger.info("✨ [MONGO CV SKILLS HIT] | Loaded field entry from Cv_Embeddings.")
-                return doc["cv_skills_embeddings"]
+                logger.info("✨ [MONGO CV SKILLS HIT] | contestId=%s jsId=%s", contest_id, js_id)
+                cached_vectors = doc.get("cv_skills_embeddings")
+                # Downstream execution layer safety check
+                return cached_vectors if isinstance(cached_vectors, dict) else {}
 
             fresh_vectors = None
             if raw_cv_skills:
                 logger.info("🔍 [MONGO CV SKILLS MISS] | Generating bulk OpenAI vectors")
                 fresh_vectors = await semantic_engine.generate_bulk_skills_embeddings(raw_cv_skills)
             else:
-                logger.warning("⚠️ No CV skills for jsId: %s. Saving null mapping.", js_id)
+                logger.warning("⚠️ No CV skills available for jsId=%s. Saving null cache marker.", js_id)
+                fresh_vectors = None  # Saves as JSON null in MongoDB
 
+            now = datetime.now(timezone.utc)
             await self.marketplace_db.Cv_Embeddings.update_one(
-                {"contestId": query_contest_id, "jsId": query_js_id},
+                {
+                    "contestId": query_contest_id,
+                    "jsId": query_js_id
+                },
                 {
                     "$set": {
-                        "cv_skills_embeddings": fresh_vectors, # Storing None as null
-                        "updatedAt": datetime.now(timezone.utc)
+                        "cv_skills_embeddings": fresh_vectors,
+                        "updatedAt": now
                     },
-                    "$setOnInsert": {"createdAt": datetime.now(timezone.utc)}
+                    "$setOnInsert": {
+                        "createdAt": now
+                    }
                 },
                 upsert=True
             )
-            return fresh_vectors
+            
+            return fresh_vectors if fresh_vectors is not None else {}
 
         except Exception as e:
-            logger.error("❌ Database tracking failed in get_or_create_cv_skills_meta: %s", e)
-            return None
+            logger.exception("❌ get_or_create_cv_skills_meta failed: %s", e)
+            return {}
 
     async def close(self) -> None:
         if self.client:

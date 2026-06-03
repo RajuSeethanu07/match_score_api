@@ -143,27 +143,16 @@ async def match_score(
     )
 
     # 1. Load Data
-    jd_cache_task = svc.db_service.get_jd_cache(payload.contestId)
-    cv_cache_task = svc.db_service.get_cv_cache(payload.contestId, payload.jsId)
     parsed_jd_task = svc.db_service.get_parsed_jd(payload.contestId)
     parsed_resume_task = svc.db_service.get_parsed_resume(payload.jsId)
 
-    jd_cache, cv_cache, parsed_jd_doc, js_doc = await asyncio.gather(
-        jd_cache_task,
-        cv_cache_task,
+    parsed_jd_doc, js_doc = await asyncio.gather(
         parsed_jd_task,
         parsed_resume_task
     )
 
-    # Ensure caches are non-None dicts
-    jd_cache = jd_cache or {}
-    cv_cache = cv_cache or {}
-
-    cached_jd_vec = jd_cache.get("embedding")
-    cached_cv_vec = cv_cache.get("embedding")
-
-    jd_raw_text = jd_cache.get("raw_text", "") or ""
-    cv_raw_text = cv_cache.get("raw_text", "") or ""
+    jd_raw_text = ""
+    cv_raw_text = ""
 
     # 2. S3 Deep Scan
     if settings.s3_deep_scan_enabled:
@@ -190,11 +179,9 @@ async def match_score(
 
         if not cv_raw_text:
             try:
-                # Safe camelCase lookup check matching payload configurations
-                recruiter_id = getattr(payload, "recruiterId", None) or getattr(payload, "recruiter_id", None)
+                # 🚀 UPDATED: Fetching CV URL strictly using contestId and jsId
                 cv_url = await svc.db_service.get_cv_meta_metadata(
                     contest_id=payload.contestId,
-                    recruiter_id=recruiter_id,
                     js_id=payload.jsId
                 )
                 if cv_url:
@@ -220,35 +207,13 @@ async def match_score(
     parsed_resume = db_mapper.map_parsed_resume(js_doc, raw_text=cv_raw_text)
 
     # 4. Scoring Engine Execution (Wired Up and Updated with Core State Context Mappings)
-    response, generated_jd_vec, generated_cv_vec = await svc.score_engine.score(
+    response = await svc.score_engine.score(
         jd=parsed_jd,
         resume=parsed_resume,
-        existing_jd_embedding=cached_jd_vec,
-        existing_resume_embedding=cached_cv_vec,
-        database_service=svc.db_service,  # 🌟 NEW: Forward db state management class instance
-        contest_id=payload.contestId,     # 🌟 NEW: Forward core job tracking identifier
-        js_id=payload.jsId                # 🌟 NEW: Forward candidate tracking identifier
+        database_service=svc.db_service,  # 🌟 Forward db state management class instance
+        contest_id=payload.contestId,     # 🌟 Forward core job tracking identifier
+        js_id=payload.jsId                # 🌟 Forward candidate tracking identifier
     )
-
-    # 5. Cache Layer Updates
-    try:
-        if (not cached_jd_vec and generated_jd_vec) or (not jd_cache.get("raw_text") and jd_raw_text):
-            await svc.db_service.cache_jd_data(
-                contest_id=payload.contestId,
-                embeddings=generated_jd_vec or cached_jd_vec or [],
-                raw_text=jd_raw_text
-            )
-
-        if (not cached_cv_vec and generated_cv_vec) or (not cv_cache.get("raw_text") and cv_raw_text):
-            await svc.db_service.cache_cv_data(
-                contest_id=payload.contestId,
-                js_id=payload.jsId,
-                embeddings=generated_cv_vec or cached_cv_vec or [],
-                raw_text=cv_raw_text
-            )
-
-    except Exception as e:
-        logger.exception("FAILED TO CACHE EMBEDDINGS/TEXT: %s", str(e))
 
     return response
 

@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Any
 from pydantic import BaseModel, Field
 
+# 🚀 UPDATED: Removed recruiterId as the pipeline now relies strictly 
+# on the contest-to-jobseeker mapping for data resolution.
 class MatchScoreRequest(BaseModel):
     contestId: str
-    recruiterId: str
     jsId: str
 
 class SkillsMatchBlock(BaseModel):
